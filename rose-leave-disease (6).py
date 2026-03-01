@@ -280,14 +280,6 @@ def augment(image, label):
         erase_w = tf.random.uniform([], img_w // 8, img_w // 4, dtype=tf.int32)
         top = tf.random.uniform([], 0, img_h - erase_h, dtype=tf.int32)
         left = tf.random.uniform([], 0, img_w - erase_w, dtype=tf.int32)
-        mask = tf.ones_like(image)
-        padding = tf.zeros([erase_h, erase_w, 3])
-        indices = tf.reshape(
-            tf.stack(tf.meshgrid(
-                tf.range(top, top + erase_h),
-                tf.range(left, left + erase_w),
-                indexing='ij'), axis=-1),
-            [-1, 2])
         # Simple masking: set erased region to dataset mean (128)
         erase_patch = tf.ones([erase_h, erase_w, 3]) * 128.0
         # Pad and apply
@@ -435,6 +427,28 @@ print('  Imbalance is handled via oversampling + focal loss + label smoothing.')
 # In[10]:
 LABEL_SMOOTHING = 0.1  # Reduces overconfidence, helps with small classes
 
+def make_focal_loss(gamma, n_classes, label_smoothing=LABEL_SMOOTHING):
+    """Create a focal loss function with label smoothing for integer labels.
+
+    Args:
+        gamma: Focusing parameter. Higher values down-weight easy examples more.
+        n_classes: Number of output classes for one-hot encoding.
+        label_smoothing: Smoothing factor (0 = no smoothing, 1 = uniform).
+
+    Returns:
+        A loss function compatible with tf.keras model.compile().
+    """
+    def focal_loss(y_true, y_pred):
+        y_true_smooth = tf.one_hot(tf.cast(y_true, tf.int32), n_classes)
+        y_true_smooth = y_true_smooth * (1.0 - label_smoothing) + label_smoothing / n_classes
+        y_pred = tf.clip_by_value(
+            y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        ce = -tf.reduce_sum(y_true_smooth * tf.math.log(y_pred), axis=-1)
+        p_t = tf.reduce_sum(y_true_smooth * y_pred, axis=-1)
+        focal_weight = tf.pow(1.0 - p_t, gamma)
+        return tf.reduce_mean(focal_weight * ce)
+    return focal_loss
+
 def build_mobilenetv2(config):
     dropout_rate  = float(config['dropout_rate'])
     dense_units   = int(config['dense_units'])
@@ -483,19 +497,6 @@ def build_mobilenetv2(config):
 
     model = tf.keras.Model(inputs, outputs)
 
-    # ── Focal loss with label smoothing ─────────────────────────────────
-    # Focal loss focuses on hard-to-classify samples (Black Spot recall 0.70).
-    # Label smoothing reduces overconfidence on tiny classes (Yellow Leaves).
-    def focal_loss_with_smoothing(y_true, y_pred):
-        y_true_smooth = tf.one_hot(tf.cast(y_true, tf.int32), num_classes)
-        y_true_smooth = y_true_smooth * (1.0 - LABEL_SMOOTHING) + LABEL_SMOOTHING / num_classes
-        y_pred = tf.clip_by_value(
-            y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
-        ce = -tf.reduce_sum(y_true_smooth * tf.math.log(y_pred), axis=-1)
-        p_t = tf.reduce_sum(y_true_smooth * y_pred, axis=-1)
-        focal_weight = tf.pow(1.0 - p_t, focal_gamma)
-        return tf.reduce_mean(focal_weight * ce)
-
     try:
         optimizer = tf.keras.optimizers.AdamW(
             learning_rate=learning_rate, weight_decay=weight_decay
@@ -505,7 +506,7 @@ def build_mobilenetv2(config):
 
     model.compile(
         optimizer=optimizer,
-        loss=focal_loss_with_smoothing,
+        loss=make_focal_loss(focal_gamma, num_classes),
         metrics=['accuracy']
     )
     return model
@@ -524,7 +525,7 @@ best_config = {
     'unfreeze_top': 30,
     'optimizer': 'AdamW',
     # Now actually used: focal loss with label smoothing replaces class-weighted crossentropy.
-    'loss': 'sparse_categorical_focal_loss',
+    'loss': 'focal_loss_with_label_smoothing',
     'focal_gamma': 2.0,
     'batch_size': 16,
     'img_size': 224,
@@ -627,19 +628,10 @@ except (AttributeError, TypeError):
     ft_optimizer = tf.keras.optimizers.Adam(learning_rate=cosine_schedule)
 
 focal_gamma_ft = float(best_config.get('focal_gamma', 2.0))
-def focal_loss_ft(y_true, y_pred):
-    y_true_smooth = tf.one_hot(tf.cast(y_true, tf.int32), num_classes)
-    y_true_smooth = y_true_smooth * (1.0 - LABEL_SMOOTHING) + LABEL_SMOOTHING / num_classes
-    y_pred = tf.clip_by_value(
-        y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
-    ce = -tf.reduce_sum(y_true_smooth * tf.math.log(y_pred), axis=-1)
-    p_t = tf.reduce_sum(y_true_smooth * y_pred, axis=-1)
-    focal_weight = tf.pow(1.0 - p_t, focal_gamma_ft)
-    return tf.reduce_mean(focal_weight * ce)
 
 best_model.compile(
     optimizer=ft_optimizer,
-    loss=focal_loss_ft,
+    loss=make_focal_loss(focal_gamma_ft, num_classes),
     metrics=['accuracy']
 )
 
