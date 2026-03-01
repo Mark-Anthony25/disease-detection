@@ -1283,22 +1283,64 @@ else:
 # **LeafNet** is a specialised CNN architecture for leaf disease classification
 # that uses multi-scale feature extraction and attention mechanisms. Key findings:
 #
-# - **Feasible elements adopted**: Multi-scale pooling (GAP + GMP concatenation)
-#   captures both average texture patterns and peak disease-indicative features.
-#   Random erasing forces the model to use distributed leaf features rather than
-#   relying on a single localised cue (a core LeafNet insight).
+# #### What We Adopted from LeafNet
 #
-# - **Not adopted (and why)**: Full LeafNet architecture replacement is not
-#   recommended because (a) MobileNetV2 is already optimised for mobile/TFLite
-#   deployment which is a project requirement, (b) LeafNet's custom layers would
-#   break TFLite compatibility, and (c) the ImageNet pretrained weights in
-#   MobileNetV2 provide a stronger starting point for a dataset of this size
-#   (~1,700 images) than training LeafNet from scratch.
+# - **Multi-scale pooling (GAP + GMP concatenation)** — captures both average
+#   texture patterns and peak disease-indicative features, which is the core
+#   design principle behind LeafNet's multi-branch architecture.
+# - **Random erasing / cutout augmentation** — forces the model to use
+#   distributed leaf features rather than relying on a single localised cue.
+#   This mimics LeafNet's strategy of learning from global leaf structure.
 #
-# - **Recommendation**: Keep MobileNetV2 backbone with the LeafNet-inspired
-#   head (multi-scale pooling + cutout augmentation). If more data becomes
-#   available (>5,000 images per class), revisit a full LeafNet or
-#   EfficientNet-B3 architecture.
+# #### Why Full LeafNet Is Not Recommended
+#
+# 1. **No pretrained weights available.** LeafNet is a custom architecture
+#    without ImageNet pretrained weights. Training from scratch on only ~1,700
+#    images (our rose leaf dataset) would almost certainly overfit — the very
+#    problem we are trying to fix. MobileNetV2's ImageNet pretraining gives us
+#    robust low-level feature detectors (edges, textures, colour gradients)
+#    that transfer well to leaf disease recognition without needing tens of
+#    thousands of domain-specific images.
+#
+# 2. **TFLite deployment incompatibility.** This project targets Android
+#    deployment via TensorFlow Lite. LeafNet's architecture includes custom
+#    multi-branch convolution blocks and channel-wise attention layers that
+#    are either unsupported by the TFLite converter or require the
+#    `SELECT_TF_OPS` fallback, which significantly increases the APK size
+#    and reduces inference speed on mobile devices. MobileNetV2 is
+#    specifically designed for efficient mobile inference with depthwise
+#    separable convolutions that convert cleanly to TFLite.
+#
+# 3. **Dataset size mismatch.** LeafNet was designed and validated on
+#    large-scale datasets like PlantVillage (~54,000 images across 38
+#    classes). Our dataset has only ~1,700 images across 4 classes.
+#    Architectures with more parameters (like LeafNet's multi-branch design)
+#    need proportionally more data to generalise well. With our dataset
+#    size, the simpler MobileNetV2 + custom head is a better fit on the
+#    bias-variance trade-off curve.
+#
+# 4. **Kaggle notebook constraints.** LeafNet's multi-branch architecture
+#    consumes significantly more GPU memory and training time than
+#    MobileNetV2. On Kaggle's free tier (single GPU, session time limits),
+#    this makes hyperparameter tuning and ablation studies impractical.
+#    MobileNetV2 trains in ~15-20 minutes per phase, leaving room for
+#    experimentation within a single Kaggle session.
+#
+# 5. **Diminishing returns for 4 classes.** LeafNet's attention mechanisms
+#    and multi-scale branches are designed to discriminate between dozens of
+#    visually similar disease classes. With only 4 classes (Black Spot,
+#    Fresh, Hole, Yellow) that have distinct visual signatures, the added
+#    complexity of LeafNet provides minimal accuracy gain while
+#    substantially increasing overfitting risk and deployment difficulty.
+#
+# #### Recommendation
+#
+# Keep MobileNetV2 as the backbone with the LeafNet-inspired modifications
+# (multi-scale pooling + cutout augmentation). This gives us the best of both
+# worlds: LeafNet's feature diversity insights with MobileNetV2's transfer
+# learning and mobile-optimised inference. If more data becomes available
+# (>5,000 images per class), revisit a full LeafNet or EfficientNet-B3
+# architecture.
 #
 # ### Remaining Recommendations
 #
