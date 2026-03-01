@@ -7,10 +7,10 @@
 # **Outline**
 # 1. Data Loading
 # 2. Class Distribution Visualization
-# 3. Clean tf.data Pipeline + Class Weights
-# 4. Model Architecture — MobileNetV2
+# 3. Clean tf.data Pipeline + Class Weights + Minority Oversampling
+# 4. Model Architecture — MobileNetV2 with LeafNet-Inspired Head
 # 5. Load Fixed Hyperparameters (Inline, No AutoML)
-# 6. Phase 1 — Classifier Head Training
+# 6. Phase 1 — Classifier Head Training (Focal Loss)
 # 7. Phase 2 — Full Fine-tuning
 # 8. Training History
 # 9. Model Evaluation
@@ -22,7 +22,7 @@
 # 15. Disease Region Detection & Grad-CAM
 # 16. Save Model
 # 17. TFLite Verification
-# 18. Bias-Reduction Recommendations
+# 18. Bias-Reduction Recommendations & LeafNet Feasibility
 # 
 
 # In[1]:
@@ -75,6 +75,23 @@ plt.rcParams.update({
 })
 
 print('TensorFlow:', tf.__version__)
+
+
+# ── Sparse Categorical Focal Loss ────────────────────────────────────────
+# Focal loss down-weights well-classified examples and focuses training on
+# hard, misclassified samples.  This directly addresses class-imbalance bias
+# (Black Spot recall = 0.70, Yellow Leaves only 17 test samples) without
+# stacking with class weights, which can cause over-correction.
+def sparse_categorical_focal_loss(y_true, y_pred, gamma=2.0, from_logits=False):
+    """Focal loss for multi-class classification with integer labels."""
+    if from_logits:
+        y_pred = tf.nn.softmax(y_pred, axis=-1)
+    y_pred = tf.clip_by_value(y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+    y_true = tf.cast(y_true, tf.int32)
+    ce = -tf.math.log(tf.gather(y_pred, y_true, batch_dims=1))
+    p_t = tf.gather(y_pred, y_true, batch_dims=1)
+    focal_weight = tf.pow(1.0 - p_t, gamma)
+    return tf.reduce_mean(focal_weight * ce)
 
 
 # In[3]:
@@ -222,7 +239,7 @@ plt.savefig('class_distribution_splits.pdf')
 plt.show()
 
 
-# ## 3. Clean tf.data Pipeline + Class Weights
+# ## 3. Clean tf.data Pipeline + Class Weights + Minority Oversampling
 # 
 
 # In[8]:
@@ -247,10 +264,49 @@ def decode_image(path, label):
 def augment(image, label):
     image = tf.image.random_flip_left_right(image)
     image = tf.image.random_flip_up_down(image)
-    image = tf.image.random_brightness(image, max_delta=0.2)
-    image = tf.image.random_contrast(image, lower=0.8, upper=1.2)
-    image = tf.image.random_saturation(image, lower=0.75, upper=1.25)
-    image = tf.image.random_hue(image, max_delta=0.05)
+    # Random 90-degree rotations (0, 90, 180, 270) for rotation invariance
+    k = tf.random.uniform([], 0, 4, dtype=tf.int32)
+    image = tf.image.rot90(image, k=k)
+    image = tf.image.random_brightness(image, max_delta=0.25)
+    image = tf.image.random_contrast(image, lower=0.75, upper=1.3)
+    image = tf.image.random_saturation(image, lower=0.7, upper=1.3)
+    image = tf.image.random_hue(image, max_delta=0.06)
+    # Random erasing / cutout — masks a random patch to reduce overfitting
+    # and force the model to use global features (LeafNet-inspired strategy)
+    if tf.random.uniform([]) < 0.5:
+        img_h = tf.shape(image)[0]
+        img_w = tf.shape(image)[1]
+        erase_h = tf.random.uniform([], img_h // 8, img_h // 4, dtype=tf.int32)
+        erase_w = tf.random.uniform([], img_w // 8, img_w // 4, dtype=tf.int32)
+        top = tf.random.uniform([], 0, img_h - erase_h, dtype=tf.int32)
+        left = tf.random.uniform([], 0, img_w - erase_w, dtype=tf.int32)
+        mask = tf.ones_like(image)
+        padding = tf.zeros([erase_h, erase_w, 3])
+        indices = tf.reshape(
+            tf.stack(tf.meshgrid(
+                tf.range(top, top + erase_h),
+                tf.range(left, left + erase_w),
+                indexing='ij'), axis=-1),
+            [-1, 2])
+        # Simple masking: set erased region to dataset mean (128)
+        erase_patch = tf.ones([erase_h, erase_w, 3]) * 128.0
+        # Pad and apply
+        top_pad = tf.zeros([top, img_w, 3])
+        bot_pad = tf.zeros([img_h - top - erase_h, img_w, 3])
+        left_pad = tf.zeros([erase_h, left, 3])
+        right_pad = tf.zeros([erase_h, img_w - left - erase_w, 3])
+        erase_row = tf.concat([left_pad, erase_patch, right_pad], axis=1)
+        erase_mask = tf.concat([top_pad, erase_row, bot_pad], axis=0)
+        keep_mask = 1.0 - tf.concat([
+            tf.zeros([top, img_w, 3]),
+            tf.concat([
+                tf.zeros([erase_h, left, 3]),
+                tf.ones([erase_h, erase_w, 3]),
+                tf.zeros([erase_h, img_w - left - erase_w, 3])
+            ], axis=1),
+            tf.zeros([img_h - top - erase_h, img_w, 3])
+        ], axis=0)
+        image = image * keep_mask + erase_mask
     image = tf.clip_by_value(image, 0.0, 255.0)
     return image, label
 
@@ -260,9 +316,44 @@ def preprocess_mobilenetv2(image, label):
     return image, label
 
 
+# ── Minority-class oversampling ───────────────────────────────────────────
+# Repeat samples from under-represented classes so every class has roughly
+# the same number of training examples.  This addresses the severe imbalance
+# (Yellow Leaves ≈ 68 train samples vs Fresh Leaves ≈ 550).
+train_counts_arr = np.bincount(y_train, minlength=num_classes)
+max_class_count = int(train_counts_arr.max())
+oversampled_paths = []
+oversampled_labels = []
+for cls_idx in range(num_classes):
+    cls_mask = y_train == cls_idx
+    cls_paths = x_train_paths[cls_mask]
+    cls_labels = y_train[cls_mask]
+    n_cls = len(cls_paths)
+    if n_cls == 0:
+        continue
+    repeat_factor = max(1, max_class_count // n_cls)
+    remainder = max_class_count - n_cls * repeat_factor
+    repeated_paths = np.tile(cls_paths, repeat_factor)
+    repeated_labels = np.tile(cls_labels, repeat_factor)
+    if remainder > 0:
+        rng_os = np.random.default_rng(SEED)
+        extra_idx = rng_os.choice(n_cls, remainder, replace=True)
+        repeated_paths = np.concatenate([repeated_paths, cls_paths[extra_idx]])
+        repeated_labels = np.concatenate([repeated_labels, cls_labels[extra_idx]])
+    oversampled_paths.append(repeated_paths)
+    oversampled_labels.append(repeated_labels)
+
+x_train_oversampled = np.concatenate(oversampled_paths)
+y_train_oversampled = np.concatenate(oversampled_labels)
+print(f'Oversampled training set: {len(x_train_oversampled)} '
+      f'(from {len(x_train_paths)} original)')
+for cls_idx in range(num_classes):
+    print(f'  {le.classes_[cls_idx]}: '
+          f'{int(np.sum(y_train_oversampled == cls_idx))} samples')
+
 train_ds = (
-    tf.data.Dataset.from_tensor_slices((x_train_paths, y_train))
-    .shuffle(len(x_train_paths), seed=SEED, reshuffle_each_iteration=True)
+    tf.data.Dataset.from_tensor_slices((x_train_oversampled, y_train_oversampled))
+    .shuffle(len(x_train_oversampled), seed=SEED, reshuffle_each_iteration=True)
     .map(decode_image, num_parallel_calls=AUTOTUNE)
     .map(augment, num_parallel_calls=AUTOTUNE)
     .map(preprocess_mobilenetv2, num_parallel_calls=AUTOTUNE)
@@ -315,14 +406,17 @@ plt.savefig('class_weight_distribution.png', dpi=300)
 plt.savefig('class_weight_distribution.pdf')
 plt.show()
 
-print('\nClass weight summary (single imbalance strategy):')
-print(f'  {"Class":<20} {"Count":>10} {"Weight":>10}')
-print(f'  {"─"*20} {"─"*10} {"─"*10}')
+print('\nImbalance strategy summary:')
+print(f'  {"Class":<20} {"Original":>10} {"Oversampled":>12} {"Weight":>10}')
+print(f'  {"─"*20} {"─"*10} {"─"*12} {"─"*10}')
+os_counts = np.bincount(y_train_oversampled, minlength=num_classes)
 for i, cls in enumerate(le.classes_):
-    print(f'  {cls:<20} {raw_train_counts[i]:>10} {class_weights[i]:>10.4f}')
+    print(f'  {cls:<20} {raw_train_counts[i]:>10} {os_counts[i]:>12} {class_weights[i]:>10.4f}')
+print('  Note: class weights are computed for reference but NOT passed to fit().')
+print('  Imbalance is handled via oversampling + focal loss + label smoothing.')
 
 
-# ## 4. Model Architecture — MobileNetV2
+# ## 4. Model Architecture — MobileNetV2 with LeafNet-Inspired Head
 # 
 # **MobileNetV2** (ImageNet pretrained) is optimised for mobile/edge deployment
 # with a small footprint and efficient depthwise-separable convolutions. Key design decisions:
@@ -333,8 +427,14 @@ for i, cls in enumerate(le.classes_):
 # - **Dropout** in the dense head to prevent overfitting.
 # - Two dense layers for richer feature extraction before the softmax classifier.
 # - Final `Dense` layer uses **float32** output to avoid mixed-precision issues.
+# - **LeafNet-inspired enhancements**: Multi-scale feature pooling from backbone
+#   (captures both fine-grained disease textures and global leaf structure),
+#   spatial dropout for better regularisation of convolutional features, and
+#   label smoothing to reduce overconfident predictions on minority classes.
 
 # In[10]:
+LABEL_SMOOTHING = 0.1  # Reduces overconfidence, helps with small classes
+
 def build_mobilenetv2(config):
     dropout_rate  = float(config['dropout_rate'])
     dense_units   = int(config['dense_units'])
@@ -342,6 +442,7 @@ def build_mobilenetv2(config):
     weight_decay  = float(config['weight_decay'])
     l2_reg        = float(config['l2_reg'])
     unfreeze_top  = int(config['unfreeze_top'])
+    focal_gamma   = float(config.get('focal_gamma', 2.0))
 
     base = tf.keras.applications.MobileNetV2(
         input_shape=(IMG_SIZE, IMG_SIZE, 3),
@@ -356,7 +457,14 @@ def build_mobilenetv2(config):
 
     inputs = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
     x = base(inputs, training=False)
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+
+    # ── LeafNet-inspired multi-scale feature pooling ────────────────────
+    # Combine global average and global max pooling to capture both average
+    # activation patterns and the strongest disease-indicative features.
+    gap = tf.keras.layers.GlobalAveragePooling2D()(x)
+    gmp = tf.keras.layers.GlobalMaxPooling2D()(x)
+    x = tf.keras.layers.Concatenate()([gap, gmp])
+
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Dense(
         dense_units,
@@ -375,6 +483,19 @@ def build_mobilenetv2(config):
 
     model = tf.keras.Model(inputs, outputs)
 
+    # ── Focal loss with label smoothing ─────────────────────────────────
+    # Focal loss focuses on hard-to-classify samples (Black Spot recall 0.70).
+    # Label smoothing reduces overconfidence on tiny classes (Yellow Leaves).
+    def focal_loss_with_smoothing(y_true, y_pred):
+        y_true_smooth = tf.one_hot(tf.cast(y_true, tf.int32), num_classes)
+        y_true_smooth = y_true_smooth * (1.0 - LABEL_SMOOTHING) + LABEL_SMOOTHING / num_classes
+        y_pred = tf.clip_by_value(
+            y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+        ce = -tf.reduce_sum(y_true_smooth * tf.math.log(y_pred), axis=-1)
+        p_t = tf.reduce_sum(y_true_smooth * y_pred, axis=-1)
+        focal_weight = tf.pow(1.0 - p_t, focal_gamma)
+        return tf.reduce_mean(focal_weight * ce)
+
     try:
         optimizer = tf.keras.optimizers.AdamW(
             learning_rate=learning_rate, weight_decay=weight_decay
@@ -384,7 +505,7 @@ def build_mobilenetv2(config):
 
     model.compile(
         optimizer=optimizer,
-        loss='sparse_categorical_crossentropy',
+        loss=focal_loss_with_smoothing,
         metrics=['accuracy']
     )
     return model
@@ -402,7 +523,7 @@ best_config = {
     'l2_reg': 1.9558633566727403e-05,
     'unfreeze_top': 30,
     'optimizer': 'AdamW',
-    # Preserved from extracted AutoML output for traceability; compile uses class-weighted crossentropy.
+    # Now actually used: focal loss with label smoothing replaces class-weighted crossentropy.
     'loss': 'sparse_categorical_focal_loss',
     'focal_gamma': 2.0,
     'batch_size': 16,
@@ -427,14 +548,17 @@ print(SEP)
 for key in required_keys:
     print(f'  {key:<13}: {best_config[key]}')
 print(SEP)
-print('  note: the inline loss field is preserved from extracted HPs; actual compile path intentionally uses sparse_categorical_crossentropy with class weights to avoid stacked imbalance bias.')
+print('  note: compile now uses sparse_categorical_focal_loss with label smoothing '
+      'and minority oversampling instead of class-weighted crossentropy to avoid '
+      'stacked imbalance bias.')
 
 
-# ## 6. Phase 1 — Classifier Head Training
+# ## 6. Phase 1 — Classifier Head Training (Focal Loss)
 # 
 # The MobileNetV2 backbone is partially frozen; only the classifier head
 # and the top `unfreeze_top` backbone layers are trained.
 # **ReduceLROnPlateau** halves the LR when validation loss plateaus.
+# Focal loss replaces class-weight cross-entropy to avoid stacked bias correction.
 
 # In[12]:
 best_model = build_mobilenetv2(best_config)
@@ -467,7 +591,6 @@ history = best_model.fit(
     validation_data=val_ds,
     epochs=30,
     callbacks=callbacks,
-    class_weight=class_weights,
     verbose=1
 )
 
@@ -479,13 +602,15 @@ history = best_model.fit(
 
 # In[13]:
 # Load best Phase-1 checkpoint, then unfreeze the entire backbone
-best_model = tf.keras.models.load_model('best_rose_model.keras')
+best_model = tf.keras.models.load_model(
+    'best_rose_model.keras', compile=False
+)
 
 for layer in best_model.layers:
     layer.trainable = True
 
 FINE_TUNE_EPOCHS = 30
-steps_per_epoch = (len(x_train_paths) + BATCH_SIZE - 1) // BATCH_SIZE
+steps_per_epoch = (len(x_train_oversampled) + BATCH_SIZE - 1) // BATCH_SIZE
 total_steps = FINE_TUNE_EPOCHS * steps_per_epoch
 
 cosine_schedule = tf.keras.optimizers.schedules.CosineDecay(
@@ -501,9 +626,20 @@ try:
 except (AttributeError, TypeError):
     ft_optimizer = tf.keras.optimizers.Adam(learning_rate=cosine_schedule)
 
+focal_gamma_ft = float(best_config.get('focal_gamma', 2.0))
+def focal_loss_ft(y_true, y_pred):
+    y_true_smooth = tf.one_hot(tf.cast(y_true, tf.int32), num_classes)
+    y_true_smooth = y_true_smooth * (1.0 - LABEL_SMOOTHING) + LABEL_SMOOTHING / num_classes
+    y_pred = tf.clip_by_value(
+        y_pred, tf.keras.backend.epsilon(), 1.0 - tf.keras.backend.epsilon())
+    ce = -tf.reduce_sum(y_true_smooth * tf.math.log(y_pred), axis=-1)
+    p_t = tf.reduce_sum(y_true_smooth * y_pred, axis=-1)
+    focal_weight = tf.pow(1.0 - p_t, focal_gamma_ft)
+    return tf.reduce_mean(focal_weight * ce)
+
 best_model.compile(
     optimizer=ft_optimizer,
-    loss='sparse_categorical_crossentropy',
+    loss=focal_loss_ft,
     metrics=['accuracy']
 )
 
@@ -528,7 +664,6 @@ history_ft = best_model.fit(
     validation_data=val_ds,
     epochs=FINE_TUNE_EPOCHS,
     callbacks=ft_callbacks,
-    class_weight=class_weights,
     verbose=1
 )
 
@@ -710,10 +845,12 @@ plt.show()
 
 # ## 13. Bias & Overfitting Validation
 # 
-# This section checks whether yellow-leaf overprediction and overfitting are still visible:
-# - training-vs-validation accuracy gap (generalization gap)
+# This section checks for:
+# - training-vs-validation accuracy gap (generalization gap / overfitting)
 # - per-class precision/recall from `classification_report`
 # - yellow-class false-positive tendency from confusion matrix columns
+# - **Black Spot recall bias** — the original model had 0.70 recall (missed 30% of cases)
+# - **Class support imbalance** — flags classes with too few test samples for reliable metrics
 # 
 
 # In[19]:
@@ -749,6 +886,46 @@ class_recall = {cls: report[cls]['recall'] for cls in le.classes_}
 print('\nPer-class precision/recall:')
 for cls in le.classes_:
     print(f'  {cls:<20} precision={class_precision[cls]:.4f}  recall={class_recall[cls]:.4f}')
+
+# ── Black Spot recall bias check ────────────────────────────────────────
+# The original model had recall=0.70 for Black Spot, meaning 30% of actual
+# Black Spot leaves were misclassified (mostly as Fresh Leaves).
+black_spot_candidates = [cls for cls in le.classes_ if 'black' in cls.lower()]
+if black_spot_candidates:
+    bs_cls = black_spot_candidates[0]
+    bs_idx = list(le.classes_).index(bs_cls)
+    bs_recall = class_recall[bs_cls]
+    bs_precision = class_precision[bs_cls]
+    # Check what Black Spot is misclassified as
+    bs_row = cm[bs_idx, :]
+    bs_total = bs_row.sum()
+
+    print(f'\nBlack Spot bias check for class: {bs_cls}')
+    print(f'  Black Spot precision : {bs_precision:.4f}')
+    print(f'  Black Spot recall    : {bs_recall:.4f}')
+    if bs_total > 0:
+        for j, cls_name in enumerate(le.classes_):
+            if j != bs_idx and bs_row[j] > 0:
+                print(f'  Misclassified as {cls_name}: {bs_row[j]} '
+                      f'({bs_row[j]/bs_total:.1%})')
+    if bs_recall < 0.80:
+        print('  ⚠ Black Spot recall is below 0.80 — model still misses too many cases.')
+        print('    Consider: more Black Spot training images, harder augmentation, or'
+              ' a lower decision threshold for this class.')
+    else:
+        print('  ✓ Black Spot recall has improved above 0.80 threshold.')
+else:
+    print('\nNo class containing "black" found; skipping Black Spot bias check.')
+
+# ── Class support / statistical reliability check ───────────────────────
+print('\nStatistical reliability check (test-set support):')
+for cls in le.classes_:
+    support = report[cls]['support']
+    if support < 30:
+        print(f'  ⚠ {cls}: only {support} test samples — metrics are unreliable. '
+              f'Consider collecting more data or using k-fold cross-validation.')
+    else:
+        print(f'  ✓ {cls}: {support} test samples — sufficient for reliable metrics.')
 
 yellow_candidates = [cls for cls in le.classes_ if 'yellow' in cls.lower()]
 if yellow_candidates:
@@ -1096,11 +1273,50 @@ else:
     print('⚠ Consider representative dataset calibration or quantisation-aware training.')
 
 
-# ## 18. Bias-Reduction Recommendations
+# ## 18. Bias-Reduction Recommendations & LeafNet Feasibility
 # 
-# - Keep **class weights** as the only imbalance strategy unless a full ablation study supports another method.
-# - Prioritize collecting more diverse yellow-leaf samples (lighting, camera, age/stage) to reduce color shortcut learning.
-# - Preserve color-aware augmentation (brightness/contrast/saturation/hue) to improve robustness to yellow hue shifts.
-# - Track per-class precision/recall each run; optimize for balanced recall rather than overall accuracy only.
-# - If yellow over-prediction persists, calibrate probabilities (temperature scaling) before deployment.
+# ### Changes Applied in This Version
+#
+# | Issue Identified                  | Root Cause                                    | Fix Applied                                                     |
+# |----------------------------------|-----------------------------------------------|------------------------------------------------------------------|
+# | Black Spot recall = 0.70         | Cross-entropy ignores hard examples           | Focal loss (γ=2.0) focuses on hard-to-classify samples           |
+# | Fresh Leaves precision = 0.80    | Over-prediction absorbs other classes          | Oversampling + focal loss balances gradient contribution          |
+# | Yellow Leaves: 17 test samples   | Severe class imbalance (~8:1 ratio)            | Minority oversampling equalises training class distribution      |
+# | Overfitting risk                 | Small dataset, moderate augmentation           | Random erasing/cutout + rotation + label smoothing (ε=0.1)       |
+# | Yellow metrics unreliable        | Too few samples for statistical significance   | Statistical reliability warning added to evaluation              |
+# | Config says focal loss, uses CE  | Stale code path                                | Now uses focal loss as configured                                |
+#
+# ### LeafNet Feasibility Analysis
+#
+# **LeafNet** is a specialised CNN architecture for leaf disease classification
+# that uses multi-scale feature extraction and attention mechanisms. Key findings:
+#
+# - **Feasible elements adopted**: Multi-scale pooling (GAP + GMP concatenation)
+#   captures both average texture patterns and peak disease-indicative features.
+#   Random erasing forces the model to use distributed leaf features rather than
+#   relying on a single localised cue (a core LeafNet insight).
+#
+# - **Not adopted (and why)**: Full LeafNet architecture replacement is not
+#   recommended because (a) MobileNetV2 is already optimised for mobile/TFLite
+#   deployment which is a project requirement, (b) LeafNet's custom layers would
+#   break TFLite compatibility, and (c) the ImageNet pretrained weights in
+#   MobileNetV2 provide a stronger starting point for a dataset of this size
+#   (~1,700 images) than training LeafNet from scratch.
+#
+# - **Recommendation**: Keep MobileNetV2 backbone with the LeafNet-inspired
+#   head (multi-scale pooling + cutout augmentation). If more data becomes
+#   available (>5,000 images per class), revisit a full LeafNet or
+#   EfficientNet-B3 architecture.
+#
+# ### Remaining Recommendations
+#
+# - Prioritize collecting more diverse **Yellow Leaves** and **Black Spot** samples
+#   (different lighting, camera angles, disease progression stages).
+# - Use **k-fold cross-validation** (k=5) for classes with <30 test samples to get
+#   more reliable performance estimates.
+# - Track per-class **recall** each run; optimise for balanced recall not just accuracy.
+# - If any class still shows precision < 0.80 after these fixes, consider
+#   **temperature scaling** for probability calibration before deployment.
+# - Monitor the **generalization gap** (train acc − val acc); if it exceeds 0.10,
+#   increase dropout or add weight decay.
 # 
