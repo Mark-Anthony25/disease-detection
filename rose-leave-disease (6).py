@@ -462,9 +462,19 @@ def build_mobilenetv2(config, plantvillage_backbone_path=None):
 
     # ── Backbone selection: PlantVillage-pretrained or ImageNet ──────────
     if plantvillage_backbone_path and os.path.isfile(plantvillage_backbone_path):
-        print('Loading PlantVillage-pretrained backbone (ImageNet → PlantVillage)...')
-        base = tf.keras.models.load_model(plantvillage_backbone_path)
-        print(f'  Backbone: {len(base.layers)} layers with PlantVillage-adapted weights.')
+        try:
+            print('Loading PlantVillage-pretrained backbone (ImageNet → PlantVillage)...')
+            base = tf.keras.models.load_model(plantvillage_backbone_path)
+            print(f'  Backbone: {len(base.layers)} layers with PlantVillage-adapted weights.')
+        except (OSError, ValueError, ImportError) as e:
+            print(f'  ⚠ Failed to load PlantVillage backbone: {e}')
+            print(f'    Delete {plantvillage_backbone_path} and re-run Phase 0 to retrain.')
+            print('    Falling back to ImageNet-only pretrained backbone.')
+            base = tf.keras.applications.MobileNetV2(
+                input_shape=(IMG_SIZE, IMG_SIZE, 3),
+                include_top=False,
+                weights='imagenet'
+            )
     else:
         if plantvillage_backbone_path:
             print(f'PlantVillage backbone not found at: {plantvillage_backbone_path}')
@@ -563,9 +573,14 @@ for candidate in PLANTVILLAGE_CANDIDATES:
         break
 
 PLANTVILLAGE_BACKBONE_PATH = 'mobilenetv2_plantvillage_backbone.keras'
-PV_EPOCHS_HEAD     = 5   # Phase 0a: head-only training on PlantVillage
-PV_EPOCHS_FINETUNE = 5   # Phase 0b: full fine-tuning on PlantVillage
+PV_EPOCHS_HEAD     = 5     # Phase 0a: head-only training on PlantVillage
+PV_EPOCHS_FINETUNE = 5     # Phase 0b: full fine-tuning on PlantVillage
 PV_BATCH_SIZE      = 32
+PV_VAL_SPLIT       = 0.15  # PlantVillage validation fraction
+PV_LR_HEAD         = 1e-3  # Learning rate for Phase 0a (head only)
+PV_LR_FINETUNE     = 1e-4  # Learning rate for Phase 0b (all layers)
+PV_DROPOUT_RATE    = 0.3
+PV_ES_PATIENCE     = 3     # EarlyStopping patience for Phase 0b
 
 plantvillage_backbone_ready = os.path.isfile(PLANTVILLAGE_BACKBONE_PATH)
 
@@ -599,7 +614,7 @@ elif PLANTVILLAGE_DIR is not None:
 
     # ── Train / validation split ────────────────────────────────────────
     pv_train_paths, pv_val_paths, pv_train_labels, pv_val_labels = train_test_split(
-        pv_paths, pv_labels, test_size=0.15, stratify=pv_labels, random_state=SEED
+        pv_paths, pv_labels, test_size=PV_VAL_SPLIT, stratify=pv_labels, random_state=SEED
     )
     print(f'  Train / Val          : {len(pv_train_paths)} / {len(pv_val_paths)}')
 
@@ -647,7 +662,7 @@ elif PLANTVILLAGE_DIR is not None:
     pv_inputs  = tf.keras.Input(shape=(IMG_SIZE, IMG_SIZE, 3))
     pv_x       = pv_base(pv_inputs, training=False)
     pv_x       = tf.keras.layers.GlobalAveragePooling2D()(pv_x)
-    pv_x       = tf.keras.layers.Dropout(0.3)(pv_x)
+    pv_x       = tf.keras.layers.Dropout(PV_DROPOUT_RATE)(pv_x)
     pv_x       = tf.keras.layers.Activation('linear', dtype='float32')(pv_x)
     pv_outputs = tf.keras.layers.Dense(
         pv_num_classes, activation='softmax', dtype='float32'
@@ -655,7 +670,7 @@ elif PLANTVILLAGE_DIR is not None:
     pv_model = tf.keras.Model(pv_inputs, pv_outputs)
 
     pv_model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=PV_LR_HEAD),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
@@ -668,7 +683,7 @@ elif PLANTVILLAGE_DIR is not None:
     # ── Phase 0b: fine-tune entire backbone on PlantVillage ─────────────
     pv_base.trainable = True
     pv_model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=PV_LR_FINETUNE),
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )
@@ -679,7 +694,7 @@ elif PLANTVILLAGE_DIR is not None:
         epochs=PV_EPOCHS_FINETUNE,
         callbacks=[
             tf.keras.callbacks.EarlyStopping(
-                monitor='val_loss', patience=3, restore_best_weights=True
+                monitor='val_loss', patience=PV_ES_PATIENCE, restore_best_weights=True
             )
         ],
         verbose=1
